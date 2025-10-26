@@ -46,13 +46,54 @@ if [[ ! -d /opt/nitter ]]; then
 fi
 
 cd /opt/nitter
-sudo -u nitter cp docker-compose.yml.example docker-compose.yml
-sudo -u nitter cp nitter.example.conf nitter.conf
+if [[ ! -f docker-compose.yml ]]; then
+  if [[ -f docker-compose.yml.example ]]; then
+    sudo -u nitter cp docker-compose.yml.example docker-compose.yml
+  else
+    cat >/opt/nitter/docker-compose.yml <<'EOF'
+version: "3.8"
+
+services:
+  nitter:
+    image: ghcr.io/zedeus/nitter:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - NITTER_CONF=/etc/nitter/nitter.conf
+    volumes:
+      - ./nitter.conf:/etc/nitter/nitter.conf:ro
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1000", "--loglevel", "warning"]
+    volumes:
+      - ./redis-data:/data
+EOF
+    chown nitter:nitter /opt/nitter/docker-compose.yml
+  fi
+fi
+
+if [[ ! -f nitter.conf ]]; then
+  if [[ -f nitter.example.conf ]]; then
+    sudo -u nitter cp nitter.example.conf nitter.conf
+  else
+    echo "nitter.conf template not found. Please supply a configuration file." >&2
+    exit 1
+  fi
+fi
+
+sudo -u nitter mkdir -p redis-data
 
 # Adjust nitter configuration
-sudo -u nitter sed -i "s/^hostname = .*/hostname = \"nitter.obsera.xyz\"/" nitter.conf
-sudo -u nitter sed -i "s/^title = .*/title = \"obsera nitter\"/" nitter.conf
-sudo -u nitter sed -i "s/^hmacKey = .*/hmacKey = \"$(openssl rand -hex 32)\"/" nitter.conf
+if [[ -f nitter.conf ]]; then
+  sudo -u nitter sed -i "s/^hostname = .*/hostname = \"nitter.obsera.xyz\"/" nitter.conf
+  sudo -u nitter sed -i "s/^title = .*/title = \"obsera nitter\"/" nitter.conf
+  sudo -u nitter sed -i "s/^hmacKey = .*/hmacKey = \"$(openssl rand -hex 32)\"/" nitter.conf
+fi
 
 # Install Caddy
 if ! command -v caddy &>/dev/null; then
