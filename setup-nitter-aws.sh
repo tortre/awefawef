@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Automated Nitter deployment for Ubuntu on AWS
 # Target domain: nitter.obsera.xyz
+# Runs as root to avoid permission issues
 
 set -euo pipefail
 
@@ -32,7 +33,7 @@ fi
 
 docker-compose version
 
-# Create nitter user
+# Create nitter user (optional, since we're running as root)
 if ! id -u nitter >/dev/null 2>&1; then
   useradd -m -s /bin/bash nitter
 fi
@@ -42,58 +43,86 @@ usermod -aG docker nitter
 # Clone Nitter repository
 if [[ ! -d /opt/nitter ]]; then
   git clone https://github.com/zedeus/nitter.git /opt/nitter
-  chown -R nitter:nitter /opt/nitter
+  chown -R 998:998 /opt/nitter  # Set ownership for container user
 fi
 
 cd /opt/nitter
+
+# Create docker-compose.yml
 if [[ ! -f docker-compose.yml ]]; then
   if [[ -f docker-compose.yml.example ]]; then
-    sudo -u nitter cp docker-compose.yml.example docker-compose.yml
+    cp docker-compose.yml.example docker-compose.yml
   else
-    cat >/opt/nitter/docker-compose.yml <<'EOF'
+    cat >docker-compose.yml <<'EOF'
 version: "3.8"
 
 services:
   nitter:
-    image: ghcr.io/zedeus/nitter:latest
+    image: zedeus/nitter:latest
+    container_name: nitter
     restart: unless-stopped
+    user: "998:998"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     ports:
       - "127.0.0.1:8080:8080"
     environment:
-      - NITTER_CONF=/etc/nitter/nitter.conf
+      - NITTER_CONF=/src/nitter.conf
     volumes:
-      - ./nitter.conf:/etc/nitter/nitter.conf:ro
+      - ./nitter.conf:/src/nitter.conf:ro
+      - ./sessions.jsonl:/src/sessions.jsonl:ro
     depends_on:
       - redis
+    healthcheck:
+      test: ["CMD-SHELL", "wget -nv --tries=1 --spider http://127.0.0.1:8080/Jack/status/20 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 2
 
   redis:
     image: redis:7-alpine
+    container_name: nitter-redis
     restart: unless-stopped
     command: ["redis-server", "--save", "60", "1000", "--loglevel", "warning"]
     volumes:
       - ./redis-data:/data
+
+volumes:
+  redis-data:
+    driver: local
 EOF
-    chown nitter:nitter /opt/nitter/docker-compose.yml
   fi
 fi
 
+# Create nitter.conf
 if [[ ! -f nitter.conf ]]; then
   if [[ -f nitter.example.conf ]]; then
-    sudo -u nitter cp nitter.example.conf nitter.conf
+    cp nitter.example.conf nitter.conf
   else
     echo "nitter.conf template not found. Please supply a configuration file." >&2
     exit 1
   fi
 fi
 
-sudo -u nitter mkdir -p redis-data
+mkdir -p redis-data
 
 # Adjust nitter configuration
 if [[ -f nitter.conf ]]; then
-  sudo -u nitter sed -i "s/^hostname = .*/hostname = \"nitter.obsera.xyz\"/" nitter.conf
-  sudo -u nitter sed -i "s/^title = .*/title = \"obsera nitter\"/" nitter.conf
-  sudo -u nitter sed -i "s/^hmacKey = .*/hmacKey = \"$(openssl rand -hex 32)\"/" nitter.conf
+  sed -i "s/^hostname = .*/hostname = \"nitter.obsera.xyz\"/" nitter.conf
+  sed -i "s/^title = .*/title = \"obsera nitter\"/" nitter.conf
+  sed -i "s/^hmacKey = .*/hmacKey = \"$(openssl rand -hex 32)\"/" nitter.conf
+  # Add session file path for container
+  sed -i '1isessionFile = "/src/sessions.jsonl"' nitter.conf
 fi
+
+# Create sessions file with proper ownership
+cat >sessions.jsonl <<'EOF'
+{"id":"account1","auth_token":"0636948293d8d90decf3aaaf1c4d98ca76a36b93","ct0":"0012b19eec580078e06034391872a07d6221501692487e088e8b15c7b5fb94699147167cfc28e8121db3553e52dc2531220797a6ceacf745e937a4e6c137a9d7f7e677f49a27e98e7276af3e8f0966b0","twid":"u=1851769418378022914","guest_id":"v1:176143861428020365","guest_id_ads":"v1:176143861428020365","guest_id_marketing":"v1:176143861428020365","auth_multi":"1939048798015094784:746eabd7d4577f766c773e718d3d0819c6ce55cc","at":"","kdt":"F9goSzrmktJESODNmmMRtxcCIMbfmF9WaokV9dZY"}
+EOF
+chown 998:998 sessions.jsonl
 
 # Install Caddy
 if ! command -v caddy &>/dev/null; then
@@ -127,7 +156,10 @@ if command -v ufw &>/dev/null; then
 fi
 
 # Start Nitter
-sudo -u nitter docker-compose pull
-sudo -u nitter docker-compose up -d
+docker-compose pull
+docker-compose up -d
 
-echo "Deployment complete. Ensure DNS for nitter.obsera.xyz points to this server's IP."
+echo "Deployment complete. Nitter should be running at https://nitter.obsera.xyz"
+echo "Check status with: docker-compose ps"
+echo "View logs with: docker-compose logs -f"
+echo "Check if running: curl -I http://localhost:8080"
